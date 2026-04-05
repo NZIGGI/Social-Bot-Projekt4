@@ -2,8 +2,8 @@
 
 - Dateien Versionieren V1, V2 ....
 
-- Anfallende Arbeiten als Issue oder SubIssue definieren
+- Anfallende Arbeiten als Issue oder subissue definieren
 
 - jeder eigene Zeit und Aufgaben minimal Dokumentieren (für Bericht am Ende)
 
-- falls Probleme einfach direkt ansprechen
+
