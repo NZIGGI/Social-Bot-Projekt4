@@ -4,6 +4,6 @@
 
 - Anfallende Arbeiten als Issue oder SubIssue definieren
 
--jeder eigene Zeit und Aufgaben minimal Dokumentieren (für Bericht am Ende)
+- jeder eigene Zeit und Aufgaben minimal Dokumentieren (für Bericht am Ende)
 
--falls Probleme einfach direkt ansprechen
+- falls Probleme einfach direkt ansprechen
