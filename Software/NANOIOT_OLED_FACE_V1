@@ -1,0 +1,150 @@
+#include <Servo.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define SCREEN_ADDRESS 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+Servo panServo;  // MG995 horizontal (Pan) auf D5
+Servo tiltServo; // ES08MD vertikal (Tilt) auf D6
+
+int panPos = 90;
+int tiltPos = 90;
+
+// Gesicht Properties
+int eyeWidth = 20;
+int eyeHeight = 25;
+int eyeY = 15;
+
+// Mund Parameter
+int mouthCenterX = 64;
+int mouthCenterY = 60;
+int mouthWidth = 50;
+float smileStrength = 0.015; // Krümmung
+
+// Pupille
+int pupilSize = 6;
+int pupilOffsetX = 0; // -5 links | 0 mitte | +5 rechts
+
+int CenterValue = 0; 
+
+void drawSmile() {
+  int startX = mouthCenterX - mouthWidth / 2;
+  int endX = mouthCenterX + mouthWidth / 2;
+
+  for (int x = startX; x < endX; x++) {
+    int dx = x - mouthCenterX;
+    int y = mouthCenterY - smileStrength * dx * dx;
+
+    display.drawPixel(x, y, WHITE);
+    display.drawPixel(x, y + 1, WHITE);
+  }
+}
+
+void drawFace(int h) {
+  display.clearDisplay();
+
+  int leftEyeX = 18;
+  int rightEyeX = 95;
+
+  // Augen
+  display.fillRoundRect(leftEyeX, eyeY, eyeWidth, h, 8, WHITE);
+  display.fillRoundRect(rightEyeX, eyeY, eyeWidth, h, 8, WHITE);
+
+  // Pupillen (schwarz)
+  int pupilY = eyeY + h / 2 + 4;
+
+  display.fillCircle(leftEyeX + eyeWidth / 2 + pupilOffsetX, pupilY, pupilSize, BLACK);
+  display.fillCircle(rightEyeX + eyeWidth / 2 + pupilOffsetX, pupilY, pupilSize, BLACK);
+
+  // Mund
+  drawSmile();
+
+  display.display();
+}
+
+void blink() {
+  for (int i = eyeHeight; i > 2; i -= 2) {
+    drawFace(i);
+    delay(15);
+  }
+
+  delay(80);
+
+  for (int i = 2; i <= eyeHeight; i += 2) {
+    drawFace(i);
+    delay(15);
+  }
+}
+
+void lookLeft() {
+  pupilOffsetX = -5;
+}
+
+void lookRight() {
+  pupilOffsetX = 5;
+}
+
+void lookCenter() {
+  pupilOffsetX = 0;
+}
+
+void setup() {
+  Serial.begin(9600);
+  display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
+  display.clearDisplay();
+  panServo.attach(5);   // D5
+  tiltServo.attach(6);  // D6
+  panServo.write(90);
+  tiltServo.write(90);
+
+  lookCenter();
+  drawFace(eyeHeight);
+
+  delay(1000);
+}
+
+void loop() {
+  int oldPanPos = panPos;
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+
+    Serial.println(command);    // Debug von FElix 
+    // Parse "PAN:90,TILT:90"
+    int panIndex = command.indexOf("PAN:");
+    int commaIndex = command.indexOf(",");
+    int tiltIndex = command.indexOf("TILT:");
+    
+    if (panIndex >= 0 && commaIndex > panIndex) {
+      int panEnd = commaIndex;
+      String panStr = command.substring(panIndex + 4, panEnd);
+      panPos = panStr.toInt();
+      panPos = constrain(panPos, 20, 160);
+      panServo.write(panPos);
+    }
+    
+    if (tiltIndex >= 0) {
+      String tiltStr = command.substring(tiltIndex + 5);
+      tiltPos = tiltStr.toInt();
+      tiltPos = constrain(tiltPos, 20, 160);
+      tiltServo.write(tiltPos);
+    }
+    if (panPos > oldPanPos) {
+      lookRight();
+    }
+    else if (panPos < oldPanPos) {
+      lookLeft();
+    }
+    else if (CenterValue == oldPanPos){
+      lookCenter();
+    }
+    CenterValue = oldPanPos;
+    drawFace(eyeHeight);
+  }
+}
