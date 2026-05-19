@@ -1,0 +1,242 @@
+import os
+import tempfile
+import time
+import shutil
+import subprocess
+import winsound
+
+import numpy as np
+import sounddevice as sd
+import scipy.io.wavfile as wavfile
+import whisper
+import ollama
+import openwakeword
+
+from openwakeword.model import Model
+
+# ----------------------------
+# Konfiguration
+# ----------------------------
+FFMPEG_BIN = r"C:\ffmpeg\bin"
+
+PIPER_EXE = "piper"  # Falls nötig: voller Pfad zur piper.exe
+PIPER_MODEL = r"C:\Users\Jukre\Desktop\piper_models\de_DE-thorsten-medium.onnx"
+PIPER_CONFIG = r"C:\Users\Jukre\Desktop\piper_models\de_DE-thorsten-medium.onnx.json"
+
+SAMPLE_RATE = 16000
+CHANNELS = 1
+COMMAND_SECONDS = 5
+FOLLOWUP_SECONDS = 5
+WAKE_THRESHOLD = 0.5
+WAKE_MODEL_NAME = "hey_jarvis"
+
+SYSTEM_PROMPT = {
+    "role": "system",
+    "content": "Du bist ein hilfreicher Sprachassistent. Antworte immer kurz, natürlich und ausschließlich auf Deutsch."
+}
+
+os.environ["PATH"] += os.pathsep + FFMPEG_BIN
+
+# ----------------------------
+# Vorchecks
+# ----------------------------
+print("FFmpeg:", shutil.which("ffmpeg"))
+print("Piper:", shutil.which(PIPER_EXE) if PIPER_EXE == "piper" else PIPER_EXE)
+
+print("📥 Lade Whisper...")
+stt_model = whisper.load_model("base")
+
+print("📥 Lade openWakeWord-Modelle...")
+openwakeword.utils.download_models()
+
+print("📥 Initialisiere Wake-Word-Modell...")
+wake_model = Model(inference_framework="onnx")
+
+print("✅ Assistent bereit. Sage 'Hey Jarvis'.")
+
+# ----------------------------
+# Hilfsfunktionen
+# ----------------------------
+def speak(text: str):
+    if not text.strip():
+        return
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        out_wav = f.name
+
+    try:
+        result = subprocess.run(
+            [
+                PIPER_EXE,
+                "-m", PIPER_MODEL,
+                "-c", PIPER_CONFIG,
+                "-f", out_wav
+            ],
+            input=text,
+            text=True,
+            capture_output=True,
+            check=True
+        )
+
+        if not os.path.exists(out_wav):
+            print("❌ WAV-Datei wurde nicht erzeugt.")
+            return
+
+        if os.path.getsize(out_wav) == 0:
+            print("❌ WAV-Datei ist leer.")
+            return
+
+        winsound.PlaySound(out_wav, winsound.SND_FILENAME)
+
+    except subprocess.CalledProcessError as e:
+        print("❌ Piper-Fehler")
+        print("STDOUT:", e.stdout)
+        print("STDERR:", e.stderr)
+    except RuntimeError as e:
+        print("❌ Windows konnte die WAV-Datei nicht abspielen:", e)
+    finally:
+        try:
+            os.remove(out_wav)
+        except OSError:
+            pass
+
+
+def record_audio(seconds, sample_rate=SAMPLE_RATE):
+    audio = sd.rec(
+        int(seconds * sample_rate),
+        samplerate=sample_rate,
+        channels=1,
+        dtype=np.float32
+    )
+    sd.wait()
+
+    audio_mono = audio.squeeze()
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        temp_wav = f.name
+
+    wavfile.write(temp_wav, sample_rate, (audio_mono * 32767).astype(np.int16))
+    return temp_wav
+
+
+def transcribe_audio(path: str):
+    result = stt_model.transcribe(path, language="de")
+    return result["text"].strip()
+
+
+def ask_ollama(messages):
+    resp = ollama.chat(
+        model="llama3.2",
+        messages=messages
+    )
+    return resp["message"]["content"].strip()
+
+
+def listen_for_command(seconds):
+    wav_path = record_audio(seconds)
+    try:
+        text = transcribe_audio(wav_path)
+    finally:
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+    return text
+
+
+# ----------------------------
+# Zustände
+# ----------------------------
+wake_detected = False
+conversation_active = False
+messages = [SYSTEM_PROMPT.copy()]
+blocksize = 1280  # 80 ms bei 16 kHz
+
+
+def reset_conversation():
+    global conversation_active, messages
+    conversation_active = False
+    messages = [SYSTEM_PROMPT.copy()]
+    print("🔄 Konversation zurückgesetzt. Warte wieder auf 'Hey Jarvis'.")
+
+
+def handle_user_text(user_text: str):
+    global messages
+
+    print("🎤 Du:", user_text)
+
+    messages.append({"role": "user", "content": user_text})
+    answer = ask_ollama(messages)
+    messages.append({"role": "assistant", "content": answer})
+
+    print("🤖 Antwort:", answer)
+    speak(answer)
+
+
+# ----------------------------
+# Wake-Word-Erkennung
+# ----------------------------
+def audio_callback(indata, frames, time_info, status):
+    global wake_detected
+
+    if status:
+        print("Audio-Status:", status)
+
+    pcm = (indata[:, 0] * 32767).astype(np.int16)
+    prediction = wake_model.predict(pcm)
+
+    score = prediction.get(WAKE_MODEL_NAME, 0.0)
+    if score >= WAKE_THRESHOLD:
+        wake_detected = True
+
+
+# ----------------------------
+# Hauptloop
+# ----------------------------
+with sd.InputStream(
+    samplerate=SAMPLE_RATE,
+    channels=CHANNELS,
+    dtype="float32",
+    blocksize=blocksize,
+    callback=audio_callback
+):
+    while True:
+        try:
+            if not conversation_active:
+                if wake_detected:
+                    wake_detected = False
+                    conversation_active = True
+                    print("✅ Wake Word erkannt: hey_jarvis")
+                    speak("Ja?")
+
+                    print("🎤 Hör zu...")
+                    user_text = listen_for_command(COMMAND_SECONDS)
+
+                    if not user_text:
+                        print("⚠️ Nichts verstanden.")
+                        speak("Ich habe nichts verstanden.")
+                        reset_conversation()
+                        continue
+
+                    handle_user_text(user_text)
+
+            else:
+                print(f"⏳ Du hast {FOLLOWUP_SECONDS} Sekunden Zeit zum Antworten...")
+                followup_text = listen_for_command(FOLLOWUP_SECONDS)
+
+                if not followup_text:
+                    print("⌛ Keine Antwort. Konversation beendet.")
+                    speak("Okay.")
+                    reset_conversation()
+                    continue
+
+                handle_user_text(followup_text)
+
+            time.sleep(0.05)
+
+        except KeyboardInterrupt:
+            print("👋 Tschüss!")
+            break
+        except Exception as e:
+            print("❌ Fehler:", e)
+            time.sleep(1)
