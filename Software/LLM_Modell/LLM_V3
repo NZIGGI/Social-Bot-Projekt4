@@ -1,0 +1,555 @@
+import os
+import tempfile
+import time
+import shutil
+import subprocess
+import winsound
+import threading
+import math
+import tkinter as tk
+import serial
+
+import numpy as np
+import sounddevice as sd
+import scipy.io.wavfile as wavfile
+import whisper
+import ollama
+import openwakeword
+
+from openwakeword.model import Model
+from scipy.io import wavfile as scipy_wavfile
+from phonemizer.separator import Separator
+
+# ----------------------------
+# eSpeak für phonemizer
+# ----------------------------
+os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = r"C:\Program Files\eSpeak NG\libespeak-ng.dll"
+os.environ["PHONEMIZER_ESPEAK_PATH"] = r"C:\Program Files\eSpeak NG\espeak-ng.exe"
+
+from phonemizer.backend.espeak.wrapper import EspeakWrapper
+EspeakWrapper.set_library(r"C:\Program Files\eSpeak NG\libespeak-ng.dll")
+
+from phonemizer import phonemize
+
+# ----------------------------
+# Konfiguration
+# ----------------------------
+PIPER_EXE = r"C:\Users\felix\Documents\Uni\Uni_Programme\piper_windows_amd64\piper\piper.exe"  # Falls nötig: voller Pfad zur piper.exe, oder "piper" wenn im PATH
+PIPER_MODEL = r"C:\Users\felix\Documents\Uni\Uni_Programme\piper_windows_amd64\piper\de_DE-thorsten-medium.onnx"
+PIPER_CONFIG = r"C:\Users\felix\Documents\Uni\Uni_Programme\piper_windows_amd64\piper\de_DE-thorsten-medium.onnx.json"
+
+SAMPLE_RATE = 16000
+CHANNELS = 1
+COMMAND_SECONDS = 5
+FOLLOWUP_SECONDS = 5
+WAKE_THRESHOLD = 0.5
+WAKE_MODEL_NAME = "hey_jarvis"
+
+WINDOW_W = 1000
+WINDOW_H = 700
+FRAME_MS = 16
+
+SYSTEM_PROMPT = {
+    "role": "system",
+    "content": "Du bist ein hilfreicher Sprachassistent. Antworte immer kurz, natürlich und ausschließlich auf Deutsch."
+}
+
+BG = "#121216"
+FACE = "#EAEAF0"
+OUTLINE = "#202028"
+EYE = "#17171B"
+CHEEK = "#F6B5C4"
+MOUTH = "#1A1A1F"
+MOUTH_INNER = "#C55C70"
+
+
+SERIAL_PORT = "COM6"
+SERIAL_BAUD = 115200
+
+# ----------------------------
+# Vorchecks
+# ----------------------------
+try:
+    arduino = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0)
+    time.sleep(2)
+    print(f"✅ Arduino verbunden über {SERIAL_PORT}")
+except Exception as e:
+    print("❌ Arduino nicht gefunden:", e)
+    arduino = None
+print("Piper:", shutil.which(PIPER_EXE) if PIPER_EXE == "piper" else PIPER_EXE)
+
+print("📥 Lade Whisper...")
+stt_model = whisper.load_model("base")
+
+print("📥 Lade openWakeWord-Modelle...")
+openwakeword.utils.download_models()
+
+print("📥 Initialisiere Wake-Word-Modell...")
+wake_model = Model(inference_framework="onnx")
+
+print("✅ Assistent bereit. Sage 'Hey Jarvis'.")
+
+# ----------------------------
+# Zustände
+# ----------------------------
+wake_detected = False
+conversation_active = False
+messages = [SYSTEM_PROMPT.copy()]
+blocksize = 1280
+
+assistant_paused = False
+
+# ----------------------------
+# Audio-Hilfsfunktionen
+# ----------------------------
+def record_audio(seconds, sample_rate=SAMPLE_RATE):
+    audio = sd.rec(
+        int(seconds * sample_rate),
+        samplerate=sample_rate,
+        channels=1,
+        dtype=np.float32
+    )
+    sd.wait()
+
+    audio_mono = audio.squeeze()
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        temp_wav = f.name
+
+    wavfile.write(temp_wav, sample_rate, (audio_mono * 32767).astype(np.int16))
+    return temp_wav
+
+def transcribe_audio(path: str):
+    sample_rate, audio = scipy_wavfile.read(path)
+
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+
+    if np.issubdtype(audio.dtype, np.integer):
+        max_value = float(np.iinfo(audio.dtype).max)
+        audio = audio.astype(np.float32) / max_value
+    else:
+        audio = audio.astype(np.float32)
+
+    if sample_rate != SAMPLE_RATE:
+        raise RuntimeError(f"Unerwartete Abtastrate: {sample_rate} Hz")
+
+    result = stt_model.transcribe(audio, language="de", fp16=False)
+    return result["text"].strip()
+
+def ask_ollama(messages):
+    resp = ollama.chat(
+        model="llama3.2",
+        messages=messages
+    )
+    return resp["message"]["content"].strip()
+
+def listen_for_command(seconds):
+    wav_path = record_audio(seconds)
+    try:
+        text = transcribe_audio(wav_path)
+    finally:
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+    return text
+
+# ----------------------------
+# TTS + Viseme
+# ----------------------------
+def send_viseme_to_arduino(viseme: str):
+    global arduino
+
+    if arduino is None:
+        return
+
+    try:
+        pan = 90
+        tilt = 90
+
+        command = f"PAN:{pan},TILT:{tilt},V:{viseme}\n"
+
+        arduino.write(command.encode("utf-8"))
+
+    except Exception as e:
+        print("Serial Fehler:", e)
+
+def synthesize_to_wav(text: str) -> str:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        out_wav = f.name
+
+    result = subprocess.run(
+        [
+            PIPER_EXE,
+            "-m", PIPER_MODEL,
+            "-c", PIPER_CONFIG,
+            "-f", out_wav
+        ],
+        input=text,
+        text=True,
+        capture_output=True
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Piper-Fehler\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+
+    if not os.path.exists(out_wav) or os.path.getsize(out_wav) == 0:
+        raise RuntimeError("Piper hat keine gültige WAV-Datei erzeugt.")
+
+    return out_wav
+
+def get_wav_duration(wav_path: str) -> float:
+    rate, data = scipy_wavfile.read(wav_path)
+    return len(data) / rate if rate > 0 else 0.0
+
+def text_to_phonemes(text: str):
+    sep = Separator(phone=" ", word="|", syllable=None)
+
+    phones = phonemize(
+        text,
+        language="de",
+        backend="espeak",
+        separator=sep,
+        strip=True,
+        preserve_punctuation=False,
+        with_stress=False
+    )
+
+    phones = phones.replace("|", " ")
+    return [p for p in phones.split() if p]
+
+def phoneme_to_viseme(ph: str) -> str:
+    ph = ph.lower()
+
+    if ph in {"m", "b", "p"}:
+        return "M"
+    if ph in {"f", "v"}:
+        return "F"
+    if ph in {"o", "oː", "ɔ", "ɔʏ", "u", "uː", "ʊ", "w"}:
+        return "O"
+    if ph in {"e", "eː", "i", "iː", "ɪ", "ɛ", "ɛː", "y", "yː", "ø", "øː"}:
+        return "E"
+    if ph in {"a", "aː", "ɑ", "ä"}:
+        return "A"
+    if ph in {
+        "s", "z", "ʃ", "ʒ", "ç", "x", "h",
+        "t", "d", "k", "g", "n", "ŋ", "l", "r", "j", "ts", "tʃ", "pf"
+    }:
+        return "S"
+
+    return "REST"
+
+def build_viseme_timeline(text: str, total_duration: float):
+    phonemes = text_to_phonemes(text)
+
+    if not phonemes or total_duration <= 0:
+        return [(0.0, max(0.1, total_duration), "REST")]
+
+    weights = []
+    for ph in phonemes:
+        vis = phoneme_to_viseme(ph)
+        if vis in {"A", "E", "O"}:
+            weights.append(1.6)
+        elif vis in {"M", "F"}:
+            weights.append(1.1)
+        elif vis == "S":
+            weights.append(1.0)
+        else:
+            weights.append(0.8)
+
+    total_weight = sum(weights) if sum(weights) > 0 else 1.0
+    lead_in = min(0.06, total_duration * 0.08)
+
+    timeline = []
+    current = 0.0
+
+    if lead_in > 0:
+        timeline.append((0.0, lead_in, "REST"))
+        current = lead_in
+
+    usable_duration = max(0.0, total_duration - lead_in)
+
+    for ph, w in zip(phonemes, weights):
+        dur = usable_duration * (w / total_weight)
+        vis = phoneme_to_viseme(ph)
+        timeline.append((current, current + dur, vis))
+        current += dur
+
+    if timeline:
+        start, _, last_vis = timeline[-1]
+        timeline[-1] = (start, total_duration, last_vis)
+
+    return timeline
+
+# ----------------------------
+# GUI
+# ----------------------------
+class TalkingFaceApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Jarvis Face")
+        self.root.configure(bg=BG)
+
+        self.canvas = tk.Canvas(
+            root,
+            width=WINDOW_W,
+            height=WINDOW_H,
+            bg=BG,
+            highlightthickness=0
+        )
+        self.canvas.pack()
+
+        self.timeline = []
+        self.duration = 0.0
+        self.start_time = None
+        self.running = False
+        self.wav_path = None
+        self.current_viseme = "REST"
+
+        self.draw_face("REST", 1.0, 0.0)
+
+    def draw_mouth_shape(self, cx, cy, viseme):
+        if viseme == "REST":
+            self.canvas.create_line(cx - 70, cy, cx + 70, cy, fill=MOUTH, width=6, smooth=True)
+        elif viseme == "M":
+            self.canvas.create_line(cx - 75, cy, cx + 75, cy, fill=MOUTH, width=8, smooth=True)
+            self.canvas.create_line(cx - 55, cy + 8, cx + 55, cy + 8, fill="#994455", width=2, smooth=True)
+        elif viseme == "F":
+            self.canvas.create_oval(cx - 75, cy - 12, cx + 75, cy + 20, fill=MOUTH, outline=MOUTH)
+            self.canvas.create_rectangle(cx - 35, cy - 4, cx + 35, cy + 4, fill="#F4F4F4", outline="")
+        elif viseme == "A":
+            self.canvas.create_oval(cx - 85, cy - 55, cx + 85, cy + 55, fill=MOUTH, outline=MOUTH)
+            self.canvas.create_oval(cx - 55, cy - 30, cx + 55, cy + 38, fill=MOUTH_INNER, outline=MOUTH_INNER)
+        elif viseme == "E":
+            self.canvas.create_oval(cx - 95, cy - 30, cx + 95, cy + 30, fill=MOUTH, outline=MOUTH)
+            self.canvas.create_oval(cx - 65, cy - 14, cx + 65, cy + 16, fill=MOUTH_INNER, outline=MOUTH_INNER)
+        elif viseme == "O":
+            self.canvas.create_oval(cx - 42, cy - 52, cx + 42, cy + 52, fill=MOUTH, outline=MOUTH)
+            self.canvas.create_oval(cx - 22, cy - 26, cx + 22, cy + 30, fill=MOUTH_INNER, outline=MOUTH_INNER)
+        elif viseme == "S":
+            self.canvas.create_oval(cx - 80, cy - 20, cx + 80, cy + 24, fill=MOUTH, outline=MOUTH)
+            self.canvas.create_line(cx - 55, cy + 2, cx + 55, cy + 2, fill="#F2F2F2", width=3)
+        else:
+            self.canvas.create_line(cx - 70, cy, cx + 70, cy, fill=MOUTH, width=6, smooth=True)
+
+    def draw_face(self, viseme, blink, t):
+        self.canvas.delete("all")
+
+        cx, cy = WINDOW_W // 2, WINDOW_H // 2
+        face_w, face_h = 420, 500
+
+        self.canvas.create_oval(
+            cx - face_w // 2, cy - face_h // 2,
+            cx + face_w // 2, cy + face_h // 2,
+            fill=FACE, outline=OUTLINE, width=4
+        )
+
+        cheek_offset = 4 * math.sin(t * 1.5)
+        self.canvas.create_oval(cx - 150, cy + 20 + cheek_offset, cx - 95, cy + 75 + cheek_offset, fill=CHEEK, outline="")
+        self.canvas.create_oval(cx + 95, cy + 20 + cheek_offset, cx + 150, cy + 75 + cheek_offset, fill=CHEEK, outline="")
+
+        self.canvas.create_line(cx - 185, cy - 130, cx - 85, cy - 140, fill=OUTLINE, width=5, smooth=True)
+        self.canvas.create_line(cx + 85, cy - 140, cx + 185, cy - 130, fill=OUTLINE, width=5, smooth=True)
+
+        eye_y = cy - 80
+        eye_h_open = 42
+        eye_h = max(4, int(eye_h_open * blink))
+
+        if eye_h <= 6:
+            self.canvas.create_line(cx - 170, eye_y, cx - 90, eye_y, fill=EYE, width=6)
+            self.canvas.create_line(cx + 90, eye_y, cx + 170, eye_y, fill=EYE, width=6)
+        else:
+            self.canvas.create_oval(cx - 170, eye_y - eye_h // 2, cx - 90, eye_y + eye_h // 2, fill=EYE, outline=EYE)
+            self.canvas.create_oval(cx + 90, eye_y - eye_h // 2, cx + 170, eye_y + eye_h // 2, fill=EYE, outline=EYE)
+
+        self.canvas.create_line(cx, cy - 20, cx - 18, cy + 40, cx + 18, cy + 40, fill=OUTLINE, width=4, smooth=True)
+
+        mouth_y = cy + 145
+        self.draw_mouth_shape(cx, mouth_y, viseme)
+
+    def current_viseme_from_time(self, elapsed):
+        for start, end, vis in self.timeline:
+            if start <= elapsed < end:
+                return vis
+        return "REST"
+
+    def play_text(self, text: str):
+        global assistant_paused
+
+        if self.running:
+            return
+
+        assistant_paused = True
+
+        self.wav_path = synthesize_to_wav(text)
+        self.duration = get_wav_duration(self.wav_path)
+        self.timeline = build_viseme_timeline(text, self.duration)
+
+        self.start_time = time.perf_counter()
+        self.running = True
+
+        winsound.PlaySound(self.wav_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        self.animate()
+
+    def animate(self):
+        global assistant_paused
+
+        if not self.running:
+            return
+       
+        elapsed = time.perf_counter() - self.start_time
+
+        if elapsed >= self.duration + 0.15:
+            self.running = False
+            assistant_paused = False
+            winsound.PlaySound(None, 0)
+            self.draw_face("REST", 1.0, elapsed)
+
+            if self.wav_path:
+                try:
+                    os.remove(self.wav_path)
+                except OSError:
+                    pass
+                self.wav_path = None
+            return
+
+        viseme = self.current_viseme_from_time(elapsed)
+        self.current_viseme = viseme
+        send_viseme_to_arduino(viseme)
+        blink = 1.0
+        blink_cycle = elapsed % 4.0
+        if 3.55 < blink_cycle < 3.72:
+            blink = max(0.08, 1.0 - ((blink_cycle - 3.55) / 0.17))
+        elif 3.72 <= blink_cycle < 3.89:
+            blink = max(0.08, (blink_cycle - 3.72) / 0.17)
+
+        self.draw_face(self.current_viseme, blink, elapsed)
+        self.root.after(FRAME_MS, self.animate)
+
+# ----------------------------
+# Konversation
+# ----------------------------
+def reset_conversation():
+    global conversation_active, messages
+    conversation_active = False
+    messages = [SYSTEM_PROMPT.copy()]
+    print("🔄 Konversation zurückgesetzt. Warte wieder auf 'Hey Jarvis'.")
+
+def handle_user_text(user_text: str, face_app: TalkingFaceApp):
+    global messages
+
+    print("🎤 Du:", user_text)
+
+    messages.append({"role": "user", "content": user_text})
+    answer = ask_ollama(messages)
+    messages.append({"role": "assistant", "content": answer})
+
+    print("🤖 Antwort:", answer)
+
+    face_app.root.after(0, lambda: face_app.play_text(answer))
+
+# ----------------------------
+# Wake Word
+# ----------------------------
+def audio_callback(indata, frames, time_info, status):
+    global wake_detected, assistant_paused
+
+    if assistant_paused:
+        return
+
+    if status:
+        print("Audio-Status:", status)
+
+    pcm = (indata[:, 0] * 32767).astype(np.int16)
+    prediction = wake_model.predict(pcm)
+
+    score = prediction.get(WAKE_MODEL_NAME, 0.0)
+    if score >= WAKE_THRESHOLD:
+        wake_detected = True
+
+# ----------------------------
+# Hintergrund-Loop
+# ----------------------------
+def assistant_loop(face_app: TalkingFaceApp):
+    global wake_detected, conversation_active
+
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype="float32",
+        blocksize=blocksize,
+        callback=audio_callback
+    ):
+        while True:
+            try:
+                if assistant_paused:
+                    time.sleep(0.05)
+                    continue
+
+                if not conversation_active:
+                    if wake_detected:
+                        wake_detected = False
+                        conversation_active = True
+                        print("✅ Wake Word erkannt: hey_jarvis")
+                        face_app.root.after(0, lambda: face_app.play_text("Ja?"))
+
+                        while face_app.running:
+                            time.sleep(0.05)
+
+                        print("🎤 Hör zu...")
+                        user_text = listen_for_command(COMMAND_SECONDS)
+
+                        if not user_text:
+                            print("⚠️ Nichts verstanden.")
+                            face_app.root.after(0, lambda: face_app.play_text("Ich habe nichts verstanden."))
+
+                            while face_app.running:
+                                time.sleep(0.05)
+
+                            reset_conversation()
+                            continue
+
+                        handle_user_text(user_text, face_app)
+
+                        while face_app.running:
+                            time.sleep(0.05)
+
+                else:
+                    print(f"⏳ Du hast {FOLLOWUP_SECONDS} Sekunden Zeit zum Antworten...")
+                    followup_text = listen_for_command(FOLLOWUP_SECONDS)
+
+                    if not followup_text:
+                        print("⌛ Keine Antwort. Konversation beendet.")
+                        face_app.root.after(0, lambda: face_app.play_text("Okay."))
+
+                        while face_app.running:
+                            time.sleep(0.05)
+
+                        reset_conversation()
+                        continue
+
+                    handle_user_text(followup_text, face_app)
+
+                    while face_app.running:
+                        time.sleep(0.05)
+
+                time.sleep(0.05)
+
+            except Exception as e:
+                print("❌ Fehler:", e)
+                time.sleep(1)
+
+# ----------------------------
+# Start
+# ----------------------------
+if __name__ == "__main__":
+    root = tk.Tk()
+    face_app = TalkingFaceApp(root)
+
+    thread = threading.Thread(target=assistant_loop, args=(face_app,), daemon=True)
+    thread.start()
+
+    root.mainloop()
