@@ -1,0 +1,87 @@
+#include <Servo.h>
+
+Servo panServo;
+Servo tiltServo;
+
+const byte PAN_PIN  = 5;
+const byte TILT_PIN = 6;
+
+// Startpositionen
+float panPos  = 90.0;   // Mitte von 0..180°
+float tiltPos = 90.0;   // Mitte von 0..90°
+
+// P-Verstärkung
+const float KpPan  = 2.5;
+const float KpTilt = 2.5;
+
+// Totzone gegen Zittern
+const float deadband = 0.08;
+
+String rxLine = "";
+
+void setup()
+{
+    Serial.begin(9600);
+
+    panServo.attach(PAN_PIN);
+    tiltServo.attach(TILT_PIN);
+
+    panServo.write(panPos);
+    tiltServo.write(tiltPos);
+}
+
+void loop()
+{
+    while (Serial.available())
+    {
+        char c = Serial.read();
+
+        if (c == '\n')
+        {
+            processLine(rxLine);
+            rxLine = "";
+        }
+        else if (c != '\r')
+        {
+            rxLine += c;
+        }
+    }
+}
+
+void processLine(String line)
+{
+    int panStart = line.indexOf("PAN:");
+    int tiltStart = line.indexOf("TILT:");
+
+    if (panStart < 0 || tiltStart < 0)
+        return;
+
+    String panStr =
+        line.substring(panStart + 4, tiltStart);
+
+    String tiltStr =
+        line.substring(tiltStart + 5);
+
+    float panError = panStr.toFloat();
+    float tiltError = tiltStr.toFloat();
+
+    // Totzone
+    if (abs(panError) < deadband)
+        panError = 0;
+
+    if (abs(tiltError) < deadband)
+        tiltError = 0;
+
+    // P-Regler
+    panPos -= panError * KpPan;
+
+    // Vorzeichen eventuell anpassen:
+    tiltPos -= tiltError * KpTilt;
+
+    // Begrenzen
+    panPos = constrain(panPos, 0, 180);
+    tiltPos = constrain(tiltPos, 45, 135);
+
+    panServo.write((int)panPos);
+    tiltServo.write((int)tiltPos);
+}
