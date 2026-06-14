@@ -1,0 +1,928 @@
+import os
+import tempfile
+import time
+import shutil
+import subprocess
+import winsound
+import threading
+import math
+import tkinter as tk
+from tkinter import ttk, messagebox
+import serial
+import serial.tools.list_ports
+import cv2
+import mediapipe as mp
+
+import numpy as np
+import sounddevice as sd
+import scipy.io.wavfile as wavfile
+import whisper
+import ollama
+import openwakeword
+
+from openwakeword.model import Model
+from scipy.io import wavfile as scipy_wavfile
+from phonemizer.separator import Separator
+from phonemizer.backend.espeak.wrapper import EspeakWrapper
+from phonemizer import phonemize
+
+# ----------------------------
+# eSpeak für phonemizer
+# ----------------------------
+os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = r"C:\Program Files\eSpeak NG\libespeak-ng.dll"
+os.environ["PHONEMIZER_ESPEAK_PATH"] = r"C:\Program Files\eSpeak NG\espeak-ng.exe"
+EspeakWrapper.set_library(r"C:\Program Files\eSpeak NG\libespeak-ng.dll")
+
+# ----------------------------
+# Konfiguration
+# ----------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+PIPER_EXE = os.path.join(BASE_DIR, "piper.exe")
+PIPER_MODEL = os.path.join(BASE_DIR, "de_DE-thorsten-medium.onnx")
+PIPER_CONFIG = os.path.join(BASE_DIR, "de_DE-thorsten-medium.onnx.json")
+
+SAMPLE_RATE = 16000
+CHANNELS = 1
+COMMAND_SECONDS = 7
+FOLLOWUP_SECONDS = 8
+WAKE_THRESHOLD = 0.02
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WAKE_MODEL_PATH = os.path.join(BASE_DIR, "hey_indy.onnx")
+WAKE_MODEL_NAME = "hey_indy"
+
+WINDOW_W = 1250
+WINDOW_H = 760
+FRAME_MS = 16
+
+SYSTEM_PROMPT = {
+    "role": "system",
+    "content": "Du bist ein hilfreicher Sprachassistent. Antworte immer kurz, natürlich und ausschließlich auf Deutsch."
+}
+
+BG = "#121216"
+PANEL = "#1A1A20"
+PANEL_2 = "#20212A"
+FACE = "#EAEAF0"
+OUTLINE = "#202028"
+EYE = "#17171B"
+CHEEK = "#F6B5C4"
+MOUTH = "#1A1A1F"
+MOUTH_INNER = "#C55C70"
+TEXT = "#F0F3F8"
+MUTED = "#A7AFBF"
+GREEN = "#3ECF8E"
+RED = "#FF6B6B"
+YELLOW = "#F4C95D"
+BLUE = "#69A7FF"
+
+SERIAL_PORT = "COM6"
+SERIAL_BAUD = 115200
+CAMERA_INDEX = 1
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+SERVO_MIN = 20
+SERVO_MAX = 160
+SERVO_CENTER = 90
+SERVO_RANGE = 45
+FACE_DETECTION_CONFIDENCE = 0.3
+SERVO_SEND_INTERVAL = 0.05
+SHOW_CAMERA_WINDOW = True
+
+# ----------------------------
+# Globaler Zustand
+# ----------------------------
+state_lock = threading.Lock()
+current_pan = SERVO_CENTER
+current_tilt = SERVO_CENTER
+current_viseme = "REST"
+last_serial_send = 0.0
+wake_detected = False
+conversation_active = False
+assistant_paused = False
+messages = [SYSTEM_PROMPT.copy()]
+blocksize = 1280
+arduino = None
+stt_model = None
+wake_model = None
+face_tracker_ready = False
+running = True
+
+status_data = {
+    "serial": {"state": "Unbekannt", "detail": "Noch nicht geprüft"},
+    "camera": {"state": "Unbekannt", "detail": "Noch nicht geprüft"},
+    "microphone": {"state": "Unbekannt", "detail": "Noch nicht geprüft"},
+    "whisper": {"state": "Unbekannt", "detail": "Nicht geladen"},
+    "wakeword": {"state": "Unbekannt", "detail": "Nicht geladen"},
+    "ollama": {"state": "Unbekannt", "detail": "Noch nicht geprüft"},
+    "piper": {"state": "Unbekannt", "detail": "Noch nicht geprüft"},
+    "conversation": {"state": "Idle", "detail": "Warte auf Wake-Word"},
+    "servo": {"state": "Neutral", "detail": "PAN 90 / TILT 90 / V REST"},
+}
+
+
+def set_status(key, state, detail):
+    with state_lock:
+        status_data[key] = {"state": state, "detail": detail}
+
+
+def get_status_snapshot():
+    with state_lock:
+        return {k: v.copy() for k, v in status_data.items()}
+
+# ----------------------------
+# Tests / Verbindung
+# ----------------------------
+def list_serial_ports():
+    return [p.device for p in serial.tools.list_ports.comports()]
+
+
+def connect_arduino():
+    global arduino
+    try:
+        arduino = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0)
+        time.sleep(2)
+        set_status("serial", "Verbunden", f"{SERIAL_PORT} @ {SERIAL_BAUD}")
+        print(f"✅ Arduino verbunden über {SERIAL_PORT}")
+        return True
+    except Exception as e:
+        arduino = None
+        ports = list_serial_ports()
+        set_status("serial", "Fehler", f"{e} | Verfügbare Ports: {ports}")
+        print("❌ Arduino nicht gefunden:", e)
+        return False
+
+
+def test_camera(index=None):
+    idx = CAMERA_INDEX if index is None else index
+    cap = cv2.VideoCapture(idx)
+    ok = cap.isOpened()
+    if ok:
+        cap.release()
+        set_status("camera", "Bereit", f"Kamera Index {idx} erreichbar")
+        return True
+    set_status("camera", "Fehler", f"Kamera Index {idx} nicht erreichbar")
+    return False
+
+
+def test_microphone():
+    try:
+        devices = sd.query_devices()
+        inputs = [d for d in devices if d.get("max_input_channels", 0) > 0]
+        if inputs:
+            name = inputs[0].get("name", "Unbekannt")
+            set_status("microphone", "Bereit", f"{len(inputs)} Eingabegeräte, z.B. {name}")
+            return True
+        set_status("microphone", "Fehler", "Kein Eingabegerät gefunden")
+        return False
+    except Exception as e:
+        set_status("microphone", "Fehler", str(e))
+        return False
+
+
+def test_piper():
+    ok = all(os.path.exists(p) for p in [PIPER_EXE, PIPER_MODEL, PIPER_CONFIG])
+    if ok:
+        set_status("piper", "Bereit", "Exe, Modell und Config gefunden")
+        return True
+    missing = [p for p in [PIPER_EXE, PIPER_MODEL, PIPER_CONFIG] if not os.path.exists(p)]
+    set_status("piper", "Fehler", "Fehlt: " + " | ".join(missing))
+    return False
+
+
+def test_ollama():
+    try:
+        resp = ollama.chat(
+            model="llama3.2",
+            messages=[{"role": "user", "content": "Antworte nur mit OK"}]
+        )
+        text = resp["message"]["content"].strip()
+        set_status("ollama", "Bereit", f"Antwort: {text[:40]}")
+        return True
+    except Exception as e:
+        set_status("ollama", "Fehler", str(e))
+        return False
+
+
+def load_models():
+    global stt_model, wake_model, face_tracker_ready
+
+    try:
+        print("📥 Lade Whisper...")
+        stt_model = whisper.load_model("base")
+        set_status("whisper", "Geladen", "Whisper base bereit")
+    except Exception as e:
+        set_status("whisper", "Fehler", str(e))
+
+    try:
+        print("📥 Lade openWakeWord-Modelle...")
+        print("📥 Initialisiere Wake-Word-Modell...")
+        wake_model = Model(
+            wakeword_models=[WAKE_MODEL_PATH],   # ← WICHTIG: Pfad angeben!
+            inference_framework="onnx"
+        )
+        loaded_keys = list(wake_model.models.keys())
+        print("Geladene Modelle:", loaded_keys)
+        set_status("wakeword", "Geladen", f"Modelle: {loaded_keys}")
+    except Exception as e:
+        set_status("wakeword", "Fehler", str(e))
+
+    face_tracker_ready = True
+
+# ----------------------------
+# Serial senden
+# ----------------------------
+def send_state_to_arduino(force=False):
+    global last_serial_send
+
+    if arduino is None:
+        return
+
+    now = time.time()
+    if not force and (now - last_serial_send) < SERVO_SEND_INTERVAL:
+        return
+
+    with state_lock:
+        pan = int(np.clip(current_pan, SERVO_MIN, SERVO_MAX))
+        tilt = int(np.clip(current_tilt, SERVO_MIN, SERVO_MAX))
+        viseme = current_viseme
+
+    command = f"PAN:{pan},TILT:{tilt},V:{viseme}\n"
+
+    try:
+        arduino.write(command.encode("utf-8"))
+        last_serial_send = now
+        set_status("servo", "Aktiv", f"PAN {pan} / TILT {tilt} / V {viseme}")
+    except Exception as e:
+        set_status("serial", "Fehler", str(e))
+        print("Serial Fehler:", e)
+
+
+def update_servo_targets(pan, tilt):
+    global current_pan, current_tilt
+    with state_lock:
+        current_pan = int(np.clip(pan, SERVO_MIN, SERVO_MAX))
+        current_tilt = int(np.clip(tilt, SERVO_MIN, SERVO_MAX))
+
+
+def update_viseme(viseme):
+    global current_viseme
+    with state_lock:
+        current_viseme = viseme
+
+# ----------------------------
+# Audio
+# ----------------------------
+def record_audio(seconds, sample_rate=SAMPLE_RATE):
+    audio = sd.rec(
+        int(seconds * sample_rate),
+        samplerate=sample_rate,
+        channels=1,
+        dtype=np.float32
+    )
+    sd.wait()
+
+    audio_mono = audio.squeeze()
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        temp_wav = f.name
+
+    wavfile.write(temp_wav, sample_rate, (audio_mono * 32767).astype(np.int16))
+    return temp_wav
+
+
+def transcribe_audio(path: str):
+    sample_rate, audio = scipy_wavfile.read(path)
+
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+
+    if np.issubdtype(audio.dtype, np.integer):
+        max_value = float(np.iinfo(audio.dtype).max)
+        audio = audio.astype(np.float32) / max_value
+    else:
+        audio = audio.astype(np.float32)
+
+    if sample_rate != SAMPLE_RATE:
+        raise RuntimeError(f"Unerwartete Abtastrate: {sample_rate} Hz")
+
+    result = stt_model.transcribe(audio, language="de", fp16=False)
+    return result["text"].strip()
+
+
+def ask_ollama(messages):
+    resp = ollama.chat(model="llama3.2", messages=messages)
+    return resp["message"]["content"].strip()
+
+
+def listen_for_command(seconds):
+    wav_path = record_audio(seconds)
+    try:
+        text = transcribe_audio(wav_path)
+    finally:
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+    return text
+
+# ----------------------------
+# TTS + Viseme
+# ----------------------------
+def synthesize_to_wav(text: str) -> str:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        out_wav = f.name
+
+    result = subprocess.run(
+        [PIPER_EXE, "-m", PIPER_MODEL, "-c", PIPER_CONFIG, "-f", out_wav],
+        input=text,
+        text=True,
+        capture_output=True
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Piper-Fehler\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
+
+    if not os.path.exists(out_wav) or os.path.getsize(out_wav) == 0:
+        raise RuntimeError("Piper hat keine gültige WAV-Datei erzeugt.")
+
+    return out_wav
+
+
+def get_wav_duration(wav_path: str) -> float:
+    rate, data = scipy_wavfile.read(wav_path)
+    return len(data) / rate if rate > 0 else 0.0
+
+
+def text_to_phonemes(text: str):
+    sep = Separator(phone=" ", word="|", syllable=None)
+    phones = phonemize(
+        text,
+        language="de",
+        backend="espeak",
+        separator=sep,
+        strip=True,
+        preserve_punctuation=False,
+        with_stress=False
+    )
+    phones = phones.replace("|", " ")
+    return [p for p in phones.split() if p]
+
+
+def phoneme_to_viseme(ph: str) -> str:
+    ph = ph.lower()
+    if ph in {"m", "b", "p"}:
+        return "M"
+    if ph in {"f", "v"}:
+        return "F"
+    if ph in {"o", "oː", "ɔ", "ɔʏ", "u", "uː", "ʊ", "w"}:
+        return "O"
+    if ph in {"e", "eː", "i", "iː", "ɪ", "ɛ", "ɛː", "y", "yː", "ø", "øː"}:
+        return "E"
+    if ph in {"a", "aː", "ɑ", "ä"}:
+        return "A"
+    if ph in {"s", "z", "ʃ", "ʒ", "ç", "x", "h", "t", "d", "k", "g", "n", "ŋ", "l", "r", "j", "ts", "tʃ", "pf"}:
+        return "S"
+    return "REST"
+
+
+def build_viseme_timeline(text: str, total_duration: float):
+    phonemes = text_to_phonemes(text)
+    if not phonemes or total_duration <= 0:
+        return [(0.0, max(0.1, total_duration), "REST")]
+
+    weights = []
+    for ph in phonemes:
+        vis = phoneme_to_viseme(ph)
+        if vis in {"A", "E", "O"}:
+            weights.append(1.6)
+        elif vis in {"M", "F"}:
+            weights.append(1.1)
+        elif vis == "S":
+            weights.append(1.0)
+        else:
+            weights.append(0.8)
+
+    total_weight = sum(weights) if sum(weights) > 0 else 1.0
+    lead_in = min(0.06, total_duration * 0.08)
+    timeline = []
+    current = 0.0
+
+    if lead_in > 0:
+        timeline.append((0.0, lead_in, "REST"))
+        current = lead_in
+
+    usable_duration = max(0.0, total_duration - lead_in)
+
+    for ph, w in zip(phonemes, weights):
+        dur = usable_duration * (w / total_weight)
+        vis = phoneme_to_viseme(ph)
+        timeline.append((current, current + dur, vis))
+        current += dur
+
+    if timeline:
+        start, _, last_vis = timeline[-1]
+        timeline[-1] = (start, total_duration, last_vis)
+
+    return timeline
+
+# ----------------------------
+# Face Tracking
+# ----------------------------
+def face_tracking_loop():
+    global arduino
+
+    import mediapipe as mp
+    from mediapipe.tasks.python import vision as mp_vision
+    from mediapipe.tasks.python.core import base_options as mp_base
+
+    options = mp_vision.FaceDetectorOptions(
+        base_options=mp_base.BaseOptions(
+            model_asset_path=r"C:\Users\Jukre\Desktop\Projekt 4\blaze_face_short_range.tflite"
+        ),
+        min_detection_confidence=0.3
+    )
+
+    cap = cv2.VideoCapture(1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    with mp_vision.FaceDetector.create_from_options(options) as detector:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            h, w = frame.shape[:2]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = detector.detect(mp_image)
+
+            pan_angle = 90
+            tilt_angle = 90
+
+            if result.detections:
+                det = result.detections[0]
+                bbox = det.bounding_box
+                center_x = bbox.origin_x + bbox.width // 2
+                center_y = bbox.origin_y + bbox.height // 2
+
+                error_x = (center_x - w // 2) / (w // 2)
+                error_y = (center_y - h // 2) / (h // 2)
+
+                pan_angle  = int(np.clip(90 + error_x * 45, 20, 160))
+                tilt_angle = int(np.clip(90 - error_y * 45, 20, 160))
+
+                cv2.rectangle(frame,
+                    (bbox.origin_x, bbox.origin_y),
+                    (bbox.origin_x + bbox.width, bbox.origin_y + bbox.height),
+                    (0, 255, 0), 2)
+
+            if arduino:
+                try:
+                    arduino.write(f"PAN:{pan_angle},TILT:{tilt_angle}\n".encode("utf-8"))
+                except Exception as e:
+                    print("Serial Fehler (Tracking):", e)
+
+            cv2.imshow("Face Tracking", frame)
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    set_status("camera", "Gestoppt", "Face-Tracking beendet")
+
+# ----------------------------
+# GUI
+# ----------------------------
+class TalkingFaceApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Jarvis Face + Diagnose")
+        self.root.configure(bg=BG)
+        self.root.geometry(f"{WINDOW_W}x{WINDOW_H}")
+
+        self.timeline = []
+        self.duration = 0.0
+        self.start_time = None
+        self.running = False
+        self.wav_path = None
+        self.local_viseme = "REST"
+
+        self.status_vars = {}
+        self.detail_vars = {}
+
+        self.build_layout()
+        self.draw_face("REST", 1.0, 0.0)
+        self.refresh_status_ui()
+
+    def build_layout(self):
+        container = tk.Frame(self.root, bg=BG)
+        container.pack(fill="both", expand=True, padx=12, pady=12)
+
+        left = tk.Frame(container, bg=BG)
+        left.pack(side="left", fill="both", expand=True)
+
+        right = tk.Frame(container, bg=PANEL, width=420)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+
+        self.canvas = tk.Canvas(left, width=780, height=720, bg=BG, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        title = tk.Label(right, text="Diagnose & Verbindung", bg=PANEL, fg=TEXT, font=("Segoe UI", 16, "bold"))
+        title.pack(anchor="w", padx=16, pady=(16, 10))
+
+        self.build_status_card(right)
+        self.build_controls(right)
+        self.build_log_hint(right)
+
+    def build_status_row(self, parent, key, label_text):
+        row = tk.Frame(parent, bg=PANEL_2)
+        row.pack(fill="x", padx=12, pady=6)
+
+        lbl = tk.Label(row, text=label_text, bg=PANEL_2, fg=TEXT, font=("Segoe UI", 10, "bold"), width=12, anchor="w")
+        lbl.grid(row=0, column=0, sticky="w", padx=(10, 8), pady=(8, 2))
+
+        state_var = tk.StringVar(value="-")
+        detail_var = tk.StringVar(value="-")
+        self.status_vars[key] = state_var
+        self.detail_vars[key] = detail_var
+
+        state_lbl = tk.Label(row, textvariable=state_var, bg=PANEL_2, fg=BLUE, font=("Segoe UI", 10, "bold"), anchor="w")
+        state_lbl.grid(row=0, column=1, sticky="w", pady=(8, 2))
+
+        detail_lbl = tk.Label(row, textvariable=detail_var, bg=PANEL_2, fg=MUTED, font=("Segoe UI", 9), anchor="w", wraplength=260, justify="left")
+        detail_lbl.grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 8))
+
+        row.grid_columnconfigure(1, weight=1)
+
+    def build_status_card(self, parent):
+        card = tk.Frame(parent, bg=PANEL)
+        card.pack(fill="x", padx=10, pady=4)
+
+        for key, label in [
+            ("serial", "Arduino"),
+            ("camera", "Kamera"),
+            ("microphone", "Mikrofon"),
+            ("whisper", "Whisper"),
+            ("wakeword", "WakeWord"),
+            ("ollama", "Ollama"),
+            ("piper", "Piper"),
+            ("conversation", "Konversation"),
+            ("servo", "Servo"),
+        ]:
+            self.build_status_row(card, key, label)
+
+    def build_controls(self, parent):
+        card = tk.Frame(parent, bg=PANEL)
+        card.pack(fill="x", padx=16, pady=(12, 8))
+
+        tk.Label(card, text="Tests", bg=PANEL, fg=TEXT, font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(0, 10))
+
+        btn_frame = tk.Frame(card, bg=PANEL)
+        btn_frame.pack(fill="x")
+
+        buttons = [
+            ("Alle testen", self.run_all_tests),
+            ("Arduino testen", self.gui_test_serial),
+            ("Kamera testen", self.gui_test_camera),
+            ("Mikrofon testen", self.gui_test_microphone),
+            ("Ollama testen", self.gui_test_ollama),
+        ]
+
+        for text, cmd in buttons:
+            tk.Button(
+                btn_frame,
+                text=text,
+                command=cmd,
+                bg="#2B2F3A",
+                fg=TEXT,
+                activebackground="#3A4050",
+                activeforeground=TEXT,
+                relief="flat",
+                padx=10,
+                pady=8
+            ).pack(fill="x", pady=4)
+
+    def build_log_hint(self, parent):
+        box = tk.Frame(parent, bg=PANEL)
+        box.pack(fill="x", padx=16, pady=(10, 16))
+        tk.Label(
+            box,
+            text="Hinweis: Detaillierte Fehlermeldungen erscheinen zusätzlich in der Konsole.",
+            bg=PANEL,
+            fg=MUTED,
+            wraplength=360,
+            justify="left",
+            font=("Segoe UI", 9)
+        ).pack(anchor="w")
+
+    def status_color(self, state):
+        s = (state or "").lower()
+        if s in {"verbunden", "bereit", "geladen", "aktiv"}:
+            return GREEN
+        if s in {"fehler"}:
+            return RED
+        if s in {"idle", "neutral", "gestoppt", "unbekannt"}:
+            return YELLOW
+        return BLUE
+
+    def refresh_status_ui(self):
+        snapshot = get_status_snapshot()
+        for key, data in snapshot.items():
+            if key in self.status_vars:
+                self.status_vars[key].set(data["state"])
+                self.detail_vars[key].set(data["detail"])
+        self.root.after(300, self.refresh_status_ui)
+
+    def gui_test_serial(self):
+        threading.Thread(target=connect_arduino, daemon=True).start()
+
+    def gui_test_camera(self):
+        threading.Thread(target=test_camera, daemon=True).start()
+
+    def gui_test_microphone(self):
+        threading.Thread(target=test_microphone, daemon=True).start()
+
+    def gui_test_ollama(self):
+        threading.Thread(target=test_ollama, daemon=True).start()
+
+    def run_all_tests(self):
+        def worker():
+            test_piper()
+            test_microphone()
+            test_camera()
+            connect_arduino()
+            test_ollama()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def draw_mouth_shape(self, cx, cy, viseme):
+        if viseme == "REST":
+            self.canvas.create_line(cx - 70, cy, cx + 70, cy, fill=MOUTH, width=6, smooth=True)
+        elif viseme == "M":
+            self.canvas.create_line(cx - 75, cy, cx + 75, cy, fill=MOUTH, width=8, smooth=True)
+            self.canvas.create_line(cx - 55, cy + 8, cx + 55, cy + 8, fill="#994455", width=2, smooth=True)
+        elif viseme == "F":
+            self.canvas.create_oval(cx - 75, cy - 12, cx + 75, cy + 20, fill=MOUTH, outline=MOUTH)
+            self.canvas.create_rectangle(cx - 35, cy - 4, cx + 35, cy + 4, fill="#F4F4F4", outline="")
+        elif viseme == "A":
+            self.canvas.create_oval(cx - 85, cy - 55, cx + 85, cy + 55, fill=MOUTH, outline=MOUTH)
+            self.canvas.create_oval(cx - 55, cy - 30, cx + 55, cy + 38, fill=MOUTH_INNER, outline=MOUTH_INNER)
+        elif viseme == "E":
+            self.canvas.create_oval(cx - 95, cy - 30, cx + 95, cy + 30, fill=MOUTH, outline=MOUTH)
+            self.canvas.create_oval(cx - 65, cy - 14, cx + 65, cy + 16, fill=MOUTH_INNER, outline=MOUTH_INNER)
+        elif viseme == "O":
+            self.canvas.create_oval(cx - 42, cy - 52, cx + 42, cy + 52, fill=MOUTH, outline=MOUTH)
+            self.canvas.create_oval(cx - 22, cy - 26, cx + 22, cy + 30, fill=MOUTH_INNER, outline=MOUTH_INNER)
+        elif viseme == "S":
+            self.canvas.create_oval(cx - 80, cy - 20, cx + 80, cy + 24, fill=MOUTH, outline=MOUTH)
+            self.canvas.create_line(cx - 55, cy + 2, cx + 55, cy + 2, fill="#F2F2F2", width=3)
+        else:
+            self.canvas.create_line(cx - 70, cy, cx + 70, cy, fill=MOUTH, width=6, smooth=True)
+
+    def draw_face(self, viseme, blink, t):
+        self.canvas.delete("all")
+
+        cx, cy = 390, 350
+        face_w, face_h = 420, 500
+
+        self.canvas.create_oval(
+            cx - face_w // 2, cy - face_h // 2,
+            cx + face_w // 2, cy + face_h // 2,
+            fill=FACE, outline=OUTLINE, width=4
+        )
+
+        cheek_offset = 4 * math.sin(t * 1.5)
+        self.canvas.create_oval(cx - 150, cy + 20 + cheek_offset, cx - 95, cy + 75 + cheek_offset, fill=CHEEK, outline="")
+        self.canvas.create_oval(cx + 95, cy + 20 + cheek_offset, cx + 150, cy + 75 + cheek_offset, fill=CHEEK, outline="")
+
+        self.canvas.create_line(cx - 185, cy - 130, cx - 85, cy - 140, fill=OUTLINE, width=5, smooth=True)
+        self.canvas.create_line(cx + 85, cy - 140, cx + 185, cy - 130, fill=OUTLINE, width=5, smooth=True)
+
+        eye_y = cy - 80
+        eye_h_open = 42
+        eye_h = max(4, int(eye_h_open * blink))
+
+        if eye_h <= 6:
+            self.canvas.create_line(cx - 170, eye_y, cx - 90, eye_y, fill=EYE, width=6)
+            self.canvas.create_line(cx + 90, eye_y, cx + 170, eye_y, fill=EYE, width=6)
+        else:
+            self.canvas.create_oval(cx - 170, eye_y - eye_h // 2, cx - 90, eye_y + eye_h // 2, fill=EYE, outline=EYE)
+            self.canvas.create_oval(cx + 90, eye_y - eye_h // 2, cx + 170, eye_y + eye_h // 2, fill=EYE, outline=EYE)
+
+        self.canvas.create_line(cx, cy - 20, cx - 18, cy + 40, cx + 18, cy + 40, fill=OUTLINE, width=4, smooth=True)
+        self.draw_mouth_shape(cx, cy + 145, viseme)
+
+        self.canvas.create_text(390, 655, text="Jarvis Status-Face", fill=MUTED, font=("Segoe UI", 11, "bold"))
+
+    def current_viseme_from_time(self, elapsed):
+        for start, end, vis in self.timeline:
+            if start <= elapsed < end:
+                return vis
+        return "REST"
+
+    def play_text(self, text: str):
+        global assistant_paused
+
+        if self.running:
+            return
+
+        assistant_paused = True
+        set_status("conversation", "Spricht", "TTS-Ausgabe aktiv")
+
+        self.wav_path = synthesize_to_wav(text)
+        self.duration = get_wav_duration(self.wav_path)
+        self.timeline = build_viseme_timeline(text, self.duration)
+
+        self.start_time = time.perf_counter()
+        self.running = True
+
+        winsound.PlaySound(self.wav_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        self.animate()
+
+    def animate(self):
+        global assistant_paused
+
+        if not self.running:
+            return
+
+        elapsed = time.perf_counter() - self.start_time
+
+        if elapsed >= self.duration + 0.15:
+            self.running = False
+            assistant_paused = False
+            winsound.PlaySound(None, 0)
+            update_viseme("REST")
+            send_state_to_arduino(force=True)
+            set_status("conversation", "Idle", "Warte auf Wake-Word")
+            self.draw_face("REST", 1.0, elapsed)
+
+            if self.wav_path:
+                try:
+                    os.remove(self.wav_path)
+                except OSError:
+                    pass
+                self.wav_path = None
+            return
+
+        viseme = self.current_viseme_from_time(elapsed)
+        self.local_viseme = viseme
+        update_viseme(viseme)
+        send_state_to_arduino(force=True)
+
+        blink = 1.0
+        blink_cycle = elapsed % 4.0
+        if 3.55 < blink_cycle < 3.72:
+            blink = max(0.08, 1.0 - ((blink_cycle - 3.55) / 0.17))
+        elif 3.72 <= blink_cycle < 3.89:
+            blink = max(0.08, (blink_cycle - 3.72) / 0.17)
+
+        self.draw_face(self.local_viseme, blink, elapsed)
+        self.root.after(FRAME_MS, self.animate)
+
+# ----------------------------
+# Conversation
+# ----------------------------
+def reset_conversation():
+    global conversation_active, messages
+    conversation_active = False
+    messages = [SYSTEM_PROMPT.copy()]
+    set_status("conversation", "Idle", "Warte auf Wake-Word")
+    print("🔄 Konversation zurückgesetzt. Warte wieder auf 'Hey Indy'.")
+
+
+def handle_user_text(user_text: str, face_app: TalkingFaceApp):
+    global messages
+    print("🎤 Du:", user_text)
+    set_status("conversation", "Verarbeitet", f"User: {user_text[:60]}")
+
+    messages.append({"role": "user", "content": user_text})
+    answer = ask_ollama(messages)
+    messages.append({"role": "assistant", "content": answer})
+
+    print("🤖 Antwort:", answer)
+    face_app.root.after(0, lambda: face_app.play_text(answer))
+
+# ----------------------------
+# Wake Word
+# ----------------------------
+def audio_callback(indata, frames, time_info, status):
+    global wake_detected, assistant_paused
+
+    if assistant_paused or wake_model is None:
+        return
+
+    pcm = (indata[:, 0] * 32767).astype(np.int16)
+    prediction = wake_model.predict(pcm)
+
+    # Score dynamisch aus dem einzigen geladenen Modell holen
+    score = max(prediction.values()) if prediction else 0.0
+
+    if score >= WAKE_THRESHOLD:
+        print(f"✅ Wake Word erkannt! Score: {score:.4f}")
+        wake_detected = True
+# ----------------------------
+# Assistant loop
+# ----------------------------
+def assistant_loop(face_app: TalkingFaceApp):
+    global wake_detected, conversation_active
+
+    while stt_model is None or wake_model is None:
+        time.sleep(0.2)
+
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype="float32",
+        blocksize=blocksize,
+        callback=audio_callback
+    ):
+        while running:
+            try:
+                if assistant_paused:
+                    time.sleep(0.05)
+                    continue
+
+                if not conversation_active:
+                    if wake_detected:
+                        wake_detected = False
+                        conversation_active = True
+                        set_status("conversation", "Aktiv", "Wake-Word erkannt")
+                        print("✅ Wake Word erkannt: hey_Indy")
+                        face_app.root.after(0, lambda: face_app.play_text("Ja?"))
+
+                        while face_app.running:
+                            time.sleep(0.05)
+
+                        set_status("conversation", "Hört zu", f"{COMMAND_SECONDS}s Aufnahme")
+                        print("🎤 Hör zu...")
+                        user_text = listen_for_command(COMMAND_SECONDS)
+
+                        if not user_text:
+                            print("⚠️ Nichts verstanden.")
+                            face_app.root.after(0, lambda: face_app.play_text("Ich habe nichts verstanden."))
+                            while face_app.running:
+                                time.sleep(0.05)
+                            reset_conversation()
+                            continue
+
+                        handle_user_text(user_text, face_app)
+                        while face_app.running:
+                            time.sleep(0.05)
+                else:
+                    set_status("conversation", "Warte auf Antwort", f"{FOLLOWUP_SECONDS}s Follow-up-Fenster")
+                    print(f"⏳ Du hast {FOLLOWUP_SECONDS} Sekunden Zeit zum Antworten...")
+                    followup_text = listen_for_command(FOLLOWUP_SECONDS)
+
+                    if not followup_text:
+                        print("⌛ Keine Antwort. Konversation beendet.")
+                        face_app.root.after(0, lambda: face_app.play_text("Okay."))
+                        while face_app.running:
+                            time.sleep(0.05)
+                        reset_conversation()
+                        continue
+
+                    handle_user_text(followup_text, face_app)
+                    while face_app.running:
+                        time.sleep(0.05)
+
+                time.sleep(0.05)
+            except Exception as e:
+                set_status("conversation", "Fehler", str(e))
+                print("❌ Fehler:", e)
+                time.sleep(1)
+
+# ----------------------------
+# Initialtests + Model load
+# ----------------------------
+def startup_init():
+    print("Piper:", shutil.which(PIPER_EXE) if PIPER_EXE == "piper" else PIPER_EXE)
+    test_piper()
+    test_microphone()
+    test_camera()
+    connect_arduino()
+    test_ollama()
+    load_models()
+    print("✅ Assistent bereit. Sage 'Hey Indy'.")
+
+# ----------------------------
+# Start
+# ----------------------------
+if __name__ == "__main__":
+    init_thread = threading.Thread(target=startup_init, daemon=True)
+    init_thread.start()
+
+    tracking_thread = threading.Thread(target=face_tracking_loop, daemon=True)
+    tracking_thread.start()
+
+    root = tk.Tk()
+    screen_w = root.winfo_screenwidth()
+    screen_h = root.winfo_screenheight()
+    root.geometry(f"{screen_w}x{screen_h}+0+0")
+    face_app = TalkingFaceApp(root)
+
+    assistant_thread = threading.Thread(target=assistant_loop, args=(face_app,), daemon=True)
+    assistant_thread.start()
+
+    root.mainloop()
