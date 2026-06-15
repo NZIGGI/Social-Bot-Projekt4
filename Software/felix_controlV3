@@ -1,7 +1,7 @@
-#include <Servo.h>   // Der Code wurde noch nicht getestet, 
-Servo panServo;      // die Parameter werte, wertegrenzen und 
-Servo tiltServo;     // und generelle Funktion ist nicht sicher
-                     // gegeben
+#include <Servo.h>   
+Servo panServo;      
+Servo tiltServo;     
+                     
 const byte PAN_PIN  = 5;
 const byte TILT_PIN = 6;
 
