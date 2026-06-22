@@ -6,7 +6,10 @@ foto messaufbau sieht man hab nen Blob also schwarzen kreis als kamera richtwert
 Die Rohdaten der Sprungantworten hab ich  aufbereitet.
 Dazu wurden die einzelnen Messungen offsetbereinigt, geglättet und gemittelt.
 Dadurch entstanden saubere mittlere Sprungantworten für PAN/TILT.
-Aus diesen Kurven konnte die Streckenverstärkung in Pixel pro Grad bestimmt werden.
+Aus diesen Kurven konnte die Streckenverstärkung in Pixel pro Grad bestimmt werden. 
+
+PAN ≈ 16.8 px/deg
+TILT ≈ 17.4 px/deg
 
 Aus den bereinigten Sprungantworten wurde  näherungsweise ein Bode-Diagramm erstellt.
 Dafür wurde die Sprungantwort abgeleitet, wodurch eine angenäherte Impulsantwort entsteht.
