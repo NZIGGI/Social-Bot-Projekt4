@@ -26,15 +26,16 @@ Die Tilt-Achse wurde durch ein PT2-Glied angenähert, da dort ein sichtbares Üb
 Weis nich ob das überschwingen über die nicht 100% feste Halterung am Kopf kam oder ob der einfach bisschen wackelt, war
 mehr die mechanik die geschwungen hat als der Servo.
 
-Die Modelle gilten der groben Klassifikation der Systeme der Regler wurde empirisch und mit mehreren Features umgesetzt.
+Die Modelle gelten der groben Klassifikation der Systeme unser finaler Regler wurde empirisch und mit mehreren Features umgesetzt.
 
 Als mögliche Erweiterung könnte der im Hauptcode verwendete Regler ebenfalls im Frequenzbereich betrachtet werden.
 Dazu könnte der offene Regelkreis aus Regler und Strecke gebildet werden.
-Damit ließe sich zeigen, wie der Arduino-Regler Betrag und Phase des Systems beeinflusst.
+Damit ließe sich zeigen, wie der Arduino-Regler Betrag und Phase des Systems beeinflusst. (weis nur nich wie guut das geht wegen der doch sehr komplexen 
+funktion mit Totzone und so)
 
 Die Messungen zeigen insgesamt, dass das Pan-/Tilt-System im kleinen Arbeitsbereich ausreichend vorhersagbar reagiert,
 um eine einfache visuelle Sollwertfolge umzusetzen.
 Die Sprungantworten und Bode-Diagramme dienen dabei als technische Grundlage und Plausibilisierung für das Regelverhalten.
 
 
-mit Bode echt ist gemeint die Berechnete Annäherung mit FFT und nicht die Annäherung über PT1/PT2
+mit den Dateien "Bodeecht" ist gemeint die Berechnete Annäherung mit FFT und nicht die Annäherung über PT1/PT2
