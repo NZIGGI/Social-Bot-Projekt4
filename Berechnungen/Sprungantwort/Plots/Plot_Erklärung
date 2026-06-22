@@ -1,0 +1,34 @@
+jo hab ca 20  Sprungantworten pro Richtung aufgenommen.
+Die Servos wurden dabei im kleinen Arbeitsbereich um definierte Winkeländerungen angesteuert,
+hauptsächlich im Bereich von 5 Grad. Die resultierende Bildverschiebung wurde über die Kamera gemessen.
+foto messaufbau sieht man hab nen Blob also schwarzen kreis als kamera richtwert genommen um die abweichung sauber zu messen.
+
+Die Rohdaten der Sprungantworten hab ich  aufbereitet.
+Dazu wurden die einzelnen Messungen offsetbereinigt, geglättet und gemittelt.
+Dadurch entstanden saubere mittlere Sprungantworten für PAN/TILT.
+Aus diesen Kurven konnte die Streckenverstärkung in Pixel pro Grad bestimmt werden.
+
+Aus den bereinigten Sprungantworten wurde  näherungsweise ein Bode-Diagramm erstellt.
+Dafür wurde die Sprungantwort abgeleitet, wodurch eine angenäherte Impulsantwort entsteht.
+Diese Impulsantwort wurde anschließend mit einer Fast-Fourier-Transformation in den Frequenzbereich überführt.
+Daraus wurde ein empirischer Frequenzgang berechnet und als Bode-Diagramm dargestellt. 
+Man erkennt daraus ganz gut das es sich ähnlich wie nen PT1/PT2 System verhält
+
+Ist kein exaktes Bodeplot über Sinus sweep sondern nur ne Annäherung aber reicht zum sehen das mal das als PT1/PT2 annähern kann.
+da die Messung durch die Kameraframerate von ungefähr 30 FPS, die geringe Anzahl an Samples und Messrauschen begrenzt ist.
+
+Für ne glattere regelungstechnische Betrachtung wurden deshalb zusätzlich einfache Ersatzmodelle gebildet.
+Die Pan-Achse wurde durch ein PT1-Glied angenähert, da sie kaum Überschwingen zeigt.
+Die Tilt-Achse wurde durch ein PT2-Glied angenähert, da dort ein sichtbares Überschwingen vorhanden ist.
+Weis nich ob das überschwingen über die nicht 100% feste Halterung am Kopf kam oder ob der einfach bisschen wackelt, war
+mehr die mechanik die geschwungen hat als der Servo.
+
+Die Modelle gilten der groben Klassifikation der Systeme der Regler wurde empirisch und mit mehreren Features umgesetzt.
+
+Als mögliche Erweiterung könnte der im Hauptcode verwendete Regler ebenfalls im Frequenzbereich betrachtet werden.
+Dazu könnte der offene Regelkreis aus Regler und Strecke gebildet werden.
+Damit ließe sich zeigen, wie der Arduino-Regler Betrag und Phase des Systems beeinflusst.
+
+Die Messungen zeigen insgesamt, dass das Pan-/Tilt-System im kleinen Arbeitsbereich ausreichend vorhersagbar reagiert,
+um eine einfache visuelle Sollwertfolge umzusetzen.
+Die Sprungantworten und Bode-Diagramme dienen dabei als technische Grundlage und Plausibilisierung für das Regelverhalten.
