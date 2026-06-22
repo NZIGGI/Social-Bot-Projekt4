@@ -32,3 +32,6 @@ Damit ließe sich zeigen, wie der Arduino-Regler Betrag und Phase des Systems be
 Die Messungen zeigen insgesamt, dass das Pan-/Tilt-System im kleinen Arbeitsbereich ausreichend vorhersagbar reagiert,
 um eine einfache visuelle Sollwertfolge umzusetzen.
 Die Sprungantworten und Bode-Diagramme dienen dabei als technische Grundlage und Plausibilisierung für das Regelverhalten.
+
+
+mit Bode echt ist gemeint die Berechnete Annäherung mit FFT und nicht die Annäherung über PT1/PT2
