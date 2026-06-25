@@ -1,0 +1,431 @@
+#include <Servo.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define SCREEN_ADDRESS 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+Servo panServo;
+Servo tiltServo;
+
+const byte PAN_PIN  = 5;
+const byte TILT_PIN = 6;
+
+//Default Servo Positionen
+float panPos = 90.0;
+float tiltPos = 90.0;
+float oldPanPos = 90.0;
+
+// Face detection timeout
+unsigned long lastFaceDetected = 0;
+const unsigned long FACE_TIMEOUT = 10000; // 10 seconds
+
+//Gesichtsanimation
+//Augen
+int eyeWidth = 18;
+int eyeHeight = 16;
+
+int leftEyeX = 24;
+int rightEyeX = 86;
+
+int eyeY = 14;
+
+int pupilSize = 3;
+int pupilOffsetX = 0;
+
+//Mund
+int mouthX = 64;
+int mouthY = 52;
+
+String currentViseme = "REST";
+
+//Regler
+// P-Verstärkung
+const float KpPan  = 2.5;
+const float KpTilt = 2.5;
+
+//D- Verstärkung
+float lastPanError = 0.0;
+float lastTiltError = 0.0;
+
+const float KdPan = 2.5;        //1,5 geht gut
+const float KdTilt = 2.5;       //1,5 geht gut
+
+//I- Verstärkung
+float panIntegral = 0.0;
+float tiltIntegral = 0.0;
+
+const float KiPan = 0.03;
+const float KiTilt = 0.03;
+
+
+// Totzone gegen Zittern
+const float deadband = 0.12;
+
+String rxLine = "";
+
+//Gesicht zeichnen
+void drawFace(int currentEyeHeight) {
+
+    display.clearDisplay();
+
+    // Augen
+    display.fillRoundRect(
+        leftEyeX,
+        eyeY,
+        eyeWidth,
+        currentEyeHeight,
+        5,
+        SSD1306_WHITE
+    );
+
+    display.fillRoundRect(
+        rightEyeX,
+        eyeY,
+        eyeWidth,
+        currentEyeHeight,
+        5,
+        SSD1306_WHITE
+    );
+
+    // Pupillen
+    if (currentEyeHeight > 6) {
+
+        int pupilY = eyeY + currentEyeHeight / 2;
+
+        display.fillCircle(
+            leftEyeX + eyeWidth / 2 + pupilOffsetX,
+            pupilY,
+            pupilSize,
+            SSD1306_BLACK
+        );
+
+        display.fillCircle(
+            rightEyeX + eyeWidth / 2 + pupilOffsetX,
+            pupilY,
+            pupilSize,
+            SSD1306_BLACK
+        );
+    }
+
+    // Mund
+    drawMouth(currentViseme);
+
+    display.display();
+}
+
+//Mundformen
+void drawMouth(String v) {
+
+    // REST
+    if (v == "REST") {
+
+    int startX = mouthX - 18;
+    int endX = mouthX + 18;
+
+    for (int x = startX; x <= endX; x++) {
+
+        int dx = x - mouthX;
+
+        // leichte Smile-Kurve
+        int y = mouthY - (0.018 * dx * dx);
+
+        display.drawPixel(x, y, SSD1306_WHITE);
+        display.drawPixel(x, y + 1, SSD1306_WHITE);
+    }
+    }
+
+    // A
+    else if (v == "A") {
+        display.drawRoundRect(mouthX - 12, mouthY - 10, 24, 20, 6, SSD1306_WHITE);
+        display.fillRoundRect(mouthX - 6, mouthY - 5, 12, 10, 3, SSD1306_WHITE);
+    }
+
+    // E
+    else if (v == "E") {
+        display.drawRoundRect(mouthX - 18, mouthY - 6, 36, 12, 4, SSD1306_WHITE);
+        display.fillRect(mouthX - 12, mouthY - 2, 24, 4, SSD1306_WHITE);
+    }
+
+    // O
+    else if (v == "O") {
+        display.drawCircle(mouthX, mouthY, 10, SSD1306_WHITE);
+        display.fillCircle(mouthX, mouthY, 4, SSD1306_WHITE);
+    }
+
+    // M
+    else if (v == "M") {
+        display.fillRect(mouthX - 16, mouthY - 1, 32, 3, SSD1306_WHITE);
+    }
+
+    // F
+    else if (v == "F") {
+        display.drawRoundRect(mouthX - 16, mouthY - 5, 32, 10, 4, SSD1306_WHITE);
+        display.drawLine(mouthX - 10, mouthY, mouthX + 10, mouthY, SSD1306_WHITE);
+    }
+
+    // S
+    else if (v == "S") {
+        display.drawRoundRect(mouthX - 18, mouthY - 4, 36, 8, 3, SSD1306_WHITE);
+    }
+}
+
+
+//Blinzeln
+void blink() {
+
+    for (int h = eyeHeight; h >= 2; h -= 2) {
+        drawFace(h);
+        delay(12);
+    }
+
+    delay(50);
+
+    for (int h = 2; h <= eyeHeight; h += 2) {
+        drawFace(h);
+        delay(12);
+    }
+}
+
+// Blickrichtungen
+void lookLeft() {
+    pupilOffsetX = -3;
+}
+
+void lookRight() {
+    pupilOffsetX = 3;
+}
+
+void lookCenter() {
+    pupilOffsetX = 0;
+}
+
+void setup() 
+{
+    Serial.begin(9600);
+
+    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    while (true);
+    }
+
+    panServo.attach(PAN_PIN);
+    tiltServo.attach(TILT_PIN);
+
+    panServo.write((int)panPos);
+    tiltServo.write((int)tiltPos);
+
+    lookCenter();
+    drawFace(eyeHeight);
+    
+    lastFaceDetected = millis();
+    
+    delay(1000);
+
+}
+
+void processLine(String line)
+{
+
+    float panStart = line.indexOf("PAN:");
+    float tiltStart = line.indexOf("TILT:");
+    // Update last detection time if a face is present
+    if (!(panStart == 0.0 && tiltStart == 0.0)){
+    lastFaceDetected = millis();
+    }
+
+    int visemeStart = line.indexOf("V:");
+
+    if (panStart < 0 || tiltStart < 0)
+        return;
+
+    int comma1 = line.indexOf(",", panStart);
+
+    String panStr =
+                line.substring(panStart + 4, comma1);
+
+    int comma2 = line.indexOf(",", tiltStart);
+
+    String tiltStr;
+
+    if (comma2 > tiltStart)
+    {
+        tiltStr = line.substring(tiltStart + 5, comma2);
+    }
+    else
+    {
+        tiltStr = line.substring(tiltStart + 5);
+    }
+
+    if(visemeStart >= 0)
+    {
+        currentViseme = line.substring(visemeStart + 2);
+        currentViseme.trim();
+    }
+
+    float panError = panStr.toFloat();
+    float tiltError = tiltStr.toFloat();
+
+    // Totzone
+    if (abs(panError) < deadband)
+        panError = 0;
+
+    if (abs(tiltError) < deadband)
+        tiltError = 0;
+
+    float panDerivative = panError - lastPanError;
+    float tiltDerivative = tiltError - lastTiltError;
+
+    float absPan = abs(panError);
+    float absTilt = abs(tiltError);
+
+    // Integrator nur im PI-Bereich aktiv
+    if (absPan < 0.27)
+    {
+        panIntegral += panError;    
+        panIntegral = constrain(panIntegral, -20.0, 20.0);
+    }
+
+    if (absTilt < 0.27)
+    {
+        tiltIntegral += tiltError;
+        tiltIntegral = constrain(tiltIntegral, -20.0, 20.0);
+    }
+
+    // PI-Regler
+    float panPI =
+        KpPan * panError
+        + KiPan * panIntegral;
+
+    float tiltPI =
+          KpTilt * tiltError
+        + KiTilt * tiltIntegral;
+
+    // PD-Regler
+    float panPD =
+          3.5 * panError
+        + KdPan * panDerivative;
+
+    float tiltPD =
+          2.8 * tiltError
+        + KdTilt * tiltDerivative;
+
+    // Überblendfaktor
+    float panBlend;
+    float tiltBlend;
+
+    // PAN
+    if (absPan <= 0.27)
+    {
+        panBlend = 0.0;
+    }
+    else if (absPan >= 0.33)
+    {
+        panBlend = 1.0;
+    }
+    else
+    {
+        panBlend = (absPan - 0.27) / 0.06;
+    }
+
+    // TILT
+    if (absTilt <= 0.27)
+    {
+        tiltBlend = 0.0;
+    }
+    else if (absTilt >= 0.33)
+    {
+        tiltBlend = 1.0;
+    }
+    else
+    {
+        tiltBlend = (absTilt - 0.27) / 0.06;
+    }
+
+    // Gain Scheduling
+    float panOutput =
+        (1.0 - panBlend) * panPI
+        + panBlend * panPD;
+
+    float tiltOutput =
+          (1.0 - tiltBlend) * tiltPI
+        + tiltBlend * tiltPD;
+
+    panPos -= panOutput;
+    tiltPos -= tiltOutput;           
+
+    // Begrenzen
+    panPos = constrain(panPos, 20, 160);
+    tiltPos = constrain(tiltPos, 45, 135);
+
+    lastPanError = panError;
+    lastTiltError = tiltError;
+
+    panServo.write((int)panPos);
+    tiltServo.write((int)tiltPos);
+
+    // Blickrichtung
+    if (panPos > oldPanPos)
+    {
+        lookRight();
+    }
+    else if (panPos < oldPanPos)
+    {
+        lookLeft();
+    }
+    else
+    {
+        lookCenter();
+    }
+
+    oldPanPos = panPos;
+
+    // Gesicht aktualisieren
+    drawFace(eyeHeight);
+}
+
+
+void loop()
+{
+    while (Serial.available())
+    {
+        char c = Serial.read();
+
+        if (c == '\n')
+        {
+            processLine(rxLine);
+            rxLine = "";
+        }
+        else if (c != '\r')
+        {
+            rxLine += c;
+        }
+    }
+    // Return to default position if no face detected for 10 seconds
+    if (millis() - lastFaceDetected > FACE_TIMEOUT)
+        {
+        panPos = 90;
+        tiltPos = 90;
+
+        panServo.write(90);
+        tiltServo.write(90);
+
+        panServo.write((int)panPos);
+        tiltServo.write((int)tiltPos);
+
+        lookCenter();
+        drawFace(eyeHeight);
+    }
+    static unsigned long lastBlink = 0;
+
+    if (millis() - lastBlink > 4000)
+    {
+        blink();
+        lastBlink = millis();
+    }
+}
+
